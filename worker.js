@@ -15,6 +15,65 @@ function escape(unsafe) {
     .replaceAll("'", "&#039;");
 }
 
+function toAbsoluteUrl(url, baseUrl) {
+  if (!url) {
+    return "";
+  }
+
+  if (url.startsWith("http://") || url.startsWith("https://")) {
+    return url;
+  }
+
+  if (url.startsWith("//")) {
+    return `${baseUrl.protocol}${url}`;
+  }
+
+  try {
+    return new URL(url, baseUrl).toString();
+  } catch {
+    return "";
+  }
+}
+
+async function fetchArticleContent(contentUrl, contentSelector, siteUrl) {
+  try {
+    const jsonRes = await fetch(`${contentUrl.replace(/\/$/, "")}/page.state.json`);
+    const contentType = jsonRes.headers.get("content-type") || "";
+
+    if (jsonRes.ok && contentType.includes("application/json")) {
+      const jsonResp = await jsonRes.json();
+      const html = jsonResp?.["page.state"]?.html;
+
+      if (html) {
+        return html.replace(/"\/assets\/img/g, `${siteUrl}/assets/img`);
+      }
+    }
+  } catch {
+    // ignore and fallback to HTML scraping
+  }
+
+  try {
+    const pageRes = await fetch(contentUrl);
+    if (!pageRes.ok) {
+      return "";
+    }
+
+    let extracted = "";
+    await new HTMLRewriter()
+      .on(contentSelector, {
+        text(text) {
+          extracted += text.text;
+        }
+      })
+      .transform(pageRes)
+      .arrayBuffer();
+
+    return extracted.trim();
+  } catch {
+    return "";
+  }
+}
+
 async function handleRequest(request) {
   const { searchParams, href } = new URL(request.url);
 
@@ -27,8 +86,9 @@ async function handleRequest(request) {
   const pubDateSelector = searchParams.get("pubDate") || '.publish-date time';
   const imageSelector = searchParams.get("image") || '.featured-image';
   const modifiedSelector = searchParams.get("modified") || '.modified-date time';
-  // contentSelector is used to select full content from article after scraping links from the post list
-  const contentSelector = searchParams.get("content") || '.post-content';
+  const contentSelectorParam = searchParams.get("content");
+  const shouldIncludeContent = Boolean(contentSelectorParam && contentSelectorParam.trim());
+  const contentSelector = shouldIncludeContent ? contentSelectorParam.trim() : null;
   const creatorSelector = searchParams.get("creator") || '.author-date a';
 
 
@@ -46,7 +106,7 @@ async function handleRequest(request) {
 
   const res = await fetch(targetUrl);
 
-  await new HTMLRewriter()
+  let rewriter = new HTMLRewriter()
     .on('head meta[name="copyright"]', {
       text(text) {
         copyrightHolder = text.text;
@@ -83,7 +143,8 @@ async function handleRequest(request) {
           creator: "",
           categories: [],
           image: "",
-          alt: ""
+          alt: "",
+          content: ""
         };
         items.push(item);
       }
@@ -100,26 +161,19 @@ async function handleRequest(request) {
     })
     .on(`${itemSelector} ${linkSelector}`, {
       async element(element) {
-        item.link = element.getAttribute("href");
+        item.link = toAbsoluteUrl(element.getAttribute("href"), targetUrl);
         const tags = element.getAttribute("data-tags")
         if (tags) {
           item.categories = tags.split(',')
         }
 
-        // Make links absolute
-        if (item.link?.startsWith("/")) {
-          item.link = `${targetUrl.origin}${item.link}`;
+        if (shouldIncludeContent && !item.content && item.link) {
+          item.content = await fetchArticleContent(item.link, contentSelector, siteUrl);
         }
 
-        // Acquire full page content
-        const contentUrl = new URL(item.link);
-        const innerRes = await fetch(contentUrl + '/page.state.json', {
-          headers: {
-            "content-type": "application/json;charset=UTF-8",
-          },
-        });
-        const jsonResp = await innerRes.json()
-        item.content = jsonResp['page.state'].html.replace(/"\/assets\/img/g,`${siteUrl}/assets/img`)
+        if (shouldIncludeContent && !item.content) {
+          item.content = item.description;
+        }
       }
     })
     .on(`${itemSelector} ${pubDateSelector}`, {
@@ -155,15 +209,20 @@ async function handleRequest(request) {
     })
     .on(`${itemSelector} ${imageSelector}`, {
       element(element) {
-        item.image = element.getAttribute("src");
+        item.image = toAbsoluteUrl(element.getAttribute("src"), targetUrl);
         item.alt = element.getAttribute("alt");
-        if (item.image?.startsWith("/")) {
-          item.image = `${targetUrl.origin}${item.image}`;
-        }
       }
-    })
-    .transform(res)
-    .arrayBuffer();
+    });
+
+  if (shouldIncludeContent) {
+    rewriter = rewriter.on(`${itemSelector} ${contentSelector}`, {
+      text(text) {
+        item.content += text.text;
+      }
+    });
+  }
+
+  await rewriter.transform(res).arrayBuffer();
 
   const lastBuildDate = (
     items.map((item) => new Date(item.lastDate)).sort((a, b) => b - a)[0] ||
@@ -212,6 +271,7 @@ ${item.categories.map((category) => `            <category>${category}</category
             <media:content url="${item.image}" medium="image">
                 <media:title type="html">${item.alt}</media:title>
             </media:content>
+${shouldIncludeContent ? `
             <content:encoded><![CDATA[
                 <div style="width: 100%;display:block;margin-bottom: 14px;text-align:center;">
                     <a href="https://www.facebook.com/sharer.php?u=${encodeURIComponent(item.link)}" style="margin: 5px; display: inline-block; text-decoration: none;"><img alt="Share on Facebook" border="0" src="${siteUrl}/assets/img/rss/facebook.png" /></a>
@@ -226,6 +286,7 @@ ${item.categories.map((category) => `            <category>${category}</category
                   <a href="${siteUrl}">${siteUrl}</a>
                 </div>]]>
             </content:encoded>
+` : ''}
         </item>`).join("\n")}
     </channel>
 </rss>`.trim();

@@ -1,0 +1,5 @@
+{
+  "name": "feed",
+  "compatibility_date": "2025-04-17",
+  "main": "worker.js"
+}
